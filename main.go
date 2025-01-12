@@ -11,30 +11,38 @@ import (
 	"net/http"
 )
 
-// main はプロキシサーバーを起動し、クライアントからの接続を待ち受けます
+// main はプロキシサーバーを起動し、クライアントからの接続を待ち受けます.
 // ポート10080でTCP接続をリッスンし、新しい接続ごとにゴルーチンを起動して
-// 並行処理を実現します
+// 並行処理を実現します.
 func main() {
 	listener, err := net.Listen(("tcp"), ":10080")
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 		return
 	}
-	defer listener.Close()
-	fmt.Println("TCP server listening on port 10080:", err)
+	defer func(listener net.Listener) {
+		err := listener.Close()
+		if err != nil {
+			fmt.Println("Error closing listener:", err)
+			return
+		}
+	}(listener)
+	fmt.Println("TCP server listening on port 10080")
 
 	for {
+		// 接続を受け入れ、新しいゴルーチンで処理
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection:", err)
 			return
 		}
 
-		go handleConnection(conn)
+		// クライアント毎に新しいゴルーチンを起動
+		go HandleConnection(conn)
 	}
 }
 
-// handleConnection はクライアントとの接続を処理します
+// handleConnection はクライアントとの接続を処理します.
 // HTTPS CONNECTトンネリングをサポートし、以下の手順で処理を行います：
 // 1. クライアントからのCONNECTリクエストを読み取り
 // 2. 対象サーバーへの接続を確立
@@ -52,7 +60,7 @@ func main() {
 //
 // パラメータ：
 //   - clientConn: クライアントからのTCP接続
-func handleConnection(clientConn net.Conn) {
+func HandleConnection(clientConn net.Conn) {
 	defer func(clientConn net.Conn) {
 		err := clientConn.Close()
 		if err != nil {
@@ -89,13 +97,12 @@ func handleConnection(clientConn net.Conn) {
 		// クライアントへ接続確立応答を送信
 		response := &http.Response{
 			StatusCode: http.StatusOK,
-			Proto:      "HTTP/1.1",
 			ProtoMajor: 1,
 			ProtoMinor: 1,
 		}
 
 		if err := response.Write(clientConn); err != nil {
-			fmt.Println("Error writng response:", err)
+			fmt.Println("Error writing response:", err)
 			return
 		}
 
