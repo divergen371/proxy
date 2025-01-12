@@ -1,0 +1,20 @@
+linters:
+  enable-all: true
+  disable:
+    - wsl
+    - gomnd
+    - nlreturn
+    - gosmopolitan
+    - depguard
+    - forbidigo
+    - execinquery
+
+linters-settings:
+  varnamelen:
+    ignore-decls:
+      - v *discordgo.VoiceStateUpdate
+      - m *discordgo.MassageCreate
+    revive:
+      rules:
+        - name: unexported-return
+          disabled: true
