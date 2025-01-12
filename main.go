@@ -42,7 +42,7 @@ func main() {
 	}
 }
 
-// handleConnection はクライアントとの接続を処理します.
+// HandleConnection handleConnection はクライアントとの接続を処理します.
 // HTTPS CONNECTトンネリングをサポートし、以下の手順で処理を行います：
 // 1. クライアントからのCONNECTリクエストを読み取り
 // 2. 対象サーバーへの接続を確立
