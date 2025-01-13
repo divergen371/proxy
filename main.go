@@ -8,31 +8,41 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // 定数定義
 const (
-	// プロキシサーバーのポート番号
-	ProxyPort = ":10080"
-	// ログファイルのパス
-	LogFilePath = "proxy.log"
-	// チャネルバッファサイズ
+	ProxyPort        = ":10080"
+	LogFilePath      = "proxy.log"
+	BlockListPath    = "blocked.yaml"
 	tunnelDirections = 2
 )
 
+// BlockList はブロックリストの構造を定義
+type BlockList struct {
+	BlockedIPs     []string `yaml:"blocked_ips"`
+	BlockedDomains []string `yaml:"blocked_domains"`
+	UpdateInterval string   `yaml:"update_interval,omitempty"`
+}
+
 // LogEntry はアクセスログの1エントリを表す構造体
 type LogEntry struct {
-	Time     time.Time // アクセス時刻
-	ClientIP string    // クライアントのIPアドレス
-	Method   string    // HTTPメソッド
-	Host     string    // 接続先ホスト
-	URI      string    // リクエストURI
-	Status   int       // ステータスコード
-	BytesIn  int64     // 受信バイト数
-	BytesOut int64     // 送信バイト数
-	Duration float64   // 処理時間（秒）
+	Time     time.Time
+	ClientIP string
+	Method   string
+	Host     string
+	URI      string
+	Status   int
+	BytesIn  int64
+	BytesOut int64
+	Duration float64
+	Blocked  bool
 }
 
 // Logger はロギング機能を提供する構造体
@@ -40,6 +50,137 @@ type Logger struct {
 	mu     sync.Mutex
 	file   *os.File
 	logger *log.Logger
+}
+
+// AccessControl はアクセス制御機能を提供する構造体
+type AccessControl struct {
+	mu             sync.RWMutex
+	blockedIPs     map[string]bool
+	blockedDomains map[string]bool
+	configPath     string
+}
+
+// NewAccessControl は新しいAccessControlインスタンスを作成する
+func NewAccessControl(configPath string) (*AccessControl, error) {
+	ac := &AccessControl{
+		blockedIPs:     make(map[string]bool),
+		blockedDomains: make(map[string]bool),
+		configPath:     configPath,
+	}
+
+	if err := ac.loadBlockList(); err != nil {
+		return nil, err
+	}
+
+	// 設定の自動リロードを開始
+	go ac.watchConfig()
+
+	return ac, nil
+}
+
+// loadBlockList はブロックリストをYAMLファイルから読み込む
+func (ac *AccessControl) loadBlockList() error {
+	data, err := os.ReadFile(ac.configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 設定ファイルが存在しない場合は、デフォルト設定を作成
+			defaultConfig := BlockList{
+				BlockedIPs:     []string{},
+				BlockedDomains: []string{},
+				UpdateInterval: "1m",
+			}
+			data, err = yaml.Marshal(defaultConfig)
+			if err != nil {
+				return fmt.Errorf("failed to create default config: %v", err)
+			}
+			if err := os.WriteFile(ac.configPath, data, 0644); err != nil {
+				return fmt.Errorf("failed to write default config: %v", err)
+			}
+		} else {
+			return fmt.Errorf("failed to read config: %v", err)
+		}
+	}
+
+	var blockList BlockList
+	if err := yaml.Unmarshal(data, &blockList); err != nil {
+		return fmt.Errorf("failed to parse config: %v", err)
+	}
+
+	// 新しいマップを作成
+	newBlockedIPs := make(map[string]bool)
+	newBlockedDomains := make(map[string]bool)
+
+	// IPアドレスの登録
+	for _, ip := range blockList.BlockedIPs {
+		newBlockedIPs[strings.TrimSpace(ip)] = true
+	}
+
+	// ドメインの登録
+	for _, domain := range blockList.BlockedDomains {
+		newBlockedDomains[strings.ToLower(strings.TrimSpace(domain))] = true
+	}
+
+	// 既存の設定を更新
+	ac.mu.Lock()
+	ac.blockedIPs = newBlockedIPs
+	ac.blockedDomains = newBlockedDomains
+	ac.mu.Unlock()
+
+	fmt.Printf("Loaded %d blocked IPs and %d blocked domains\n",
+		len(blockList.BlockedIPs), len(blockList.BlockedDomains))
+	return nil
+}
+
+// watchConfig は設定ファイルの変更を監視し、自動的に再読み込みを行う
+func (ac *AccessControl) watchConfig() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	var lastModTime time.Time
+	for range ticker.C {
+		stat, err := os.Stat(ac.configPath)
+		if err != nil {
+			fmt.Printf("Error checking config file: %v\n", err)
+			continue
+		}
+
+		if stat.ModTime().After(lastModTime) {
+			if err := ac.loadBlockList(); err != nil {
+				fmt.Printf("Error reloading config: %v\n", err)
+				continue
+			}
+			lastModTime = stat.ModTime()
+			fmt.Println("Config reloaded successfully")
+		}
+	}
+}
+
+// isBlocked は指定されたIPアドレスまたはドメインがブロックされているか確認する
+func (ac *AccessControl) isBlocked(ip, domain string) bool {
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+
+	// IPアドレスのチェック
+	if ac.blockedIPs[ip] {
+		return true
+	}
+
+	// ドメインのチェック
+	domain = strings.ToLower(domain)
+	if ac.blockedDomains[domain] {
+		return true
+	}
+
+	// ワイルドカードドメインのチェック
+	parts := strings.Split(domain, ".")
+	for i := 0; i < len(parts)-1; i++ {
+		wildcard := "*." + strings.Join(parts[i+1:], ".")
+		if ac.blockedDomains[wildcard] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // NewLogger は新しいLoggerインスタンスを作成する
@@ -60,9 +201,8 @@ func (l *Logger) Log(entry LogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// ログメッセージのフォーマット
 	message := fmt.Sprintf(
-		"%s %s %s %s %d %d bytes in %d bytes out %.3f seconds",
+		"%s %s %s %s %d %d bytes in %d bytes out %.3f seconds blocked=%v",
 		entry.ClientIP,
 		entry.Method,
 		entry.Host,
@@ -71,6 +211,7 @@ func (l *Logger) Log(entry LogEntry) {
 		entry.BytesIn,
 		entry.BytesOut,
 		entry.Duration,
+		entry.Blocked,
 	)
 
 	l.logger.Println(message)
@@ -84,12 +225,14 @@ func (l *Logger) Close() error {
 // Proxy はプロキシサーバーの構造体
 type Proxy struct {
 	logger *Logger
+	ac     *AccessControl
 }
 
 // NewProxy は新しいProxyインスタンスを作成する
-func NewProxy(logger *Logger) *Proxy {
+func NewProxy(logger *Logger, ac *AccessControl) *Proxy {
 	return &Proxy{
 		logger: logger,
+		ac:     ac,
 	}
 }
 
@@ -119,8 +262,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 	startTime := time.Now()
 	clientIP := clientConn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
 
-	// リクエストの読み取り
 	reader := bufio.NewReader(clientConn)
 	request, err := http.ReadRequest(reader)
 	if err != nil {
@@ -128,7 +273,6 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	// ログエントリの初期化
 	logEntry := LogEntry{
 		Time:     startTime,
 		ClientIP: clientIP,
@@ -137,7 +281,29 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		URI:      request.RequestURI,
 	}
 
-	// CONNECTメソッドの処理
+	// アクセス制御チェック
+	host := request.Host
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	if p.ac.isBlocked(clientIP, host) {
+		logEntry.Status = http.StatusForbidden
+		logEntry.Blocked = true
+		p.logger.Log(logEntry)
+
+		response := &http.Response{
+			Status:     "403 Forbidden",
+			StatusCode: http.StatusForbidden,
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Body:       io.NopCloser(strings.NewReader("Access Denied")),
+		}
+		response.Write(clientConn)
+		return
+	}
+
 	if request.Method == http.MethodConnect {
 		p.handleTunneling(clientConn, request, &logEntry)
 	} else {
@@ -152,7 +318,7 @@ func (p *Proxy) handleTunneling(
 	clientConn net.Conn, request *http.Request, logEntry *LogEntry,
 ) {
 	startTime := time.Now()
-	// サーバーへの接続
+
 	serverConn, err := net.Dial("tcp", request.Host)
 	if err != nil {
 		fmt.Printf("Error connecting to server: %v\n", err)
@@ -162,7 +328,6 @@ func (p *Proxy) handleTunneling(
 	}
 	defer serverConn.Close()
 
-	// クライアントへ200 OKを送信
 	response := &http.Response{
 		Status:     "200 Connection established",
 		StatusCode: http.StatusOK,
@@ -178,12 +343,10 @@ func (p *Proxy) handleTunneling(
 		return
 	}
 
-	// 双方向トンネルの作成
 	bytesIn := make(chan int64, 1)
 	bytesOut := make(chan int64, 1)
 	done := make(chan bool, tunnelDirections)
 
-	// クライアント → サーバー
 	go func() {
 		n, err := io.Copy(serverConn, clientConn)
 		if err != nil {
@@ -193,7 +356,6 @@ func (p *Proxy) handleTunneling(
 		done <- true
 	}()
 
-	// サーバー → クライアント
 	go func() {
 		n, err := io.Copy(clientConn, serverConn)
 		if err != nil {
@@ -203,7 +365,6 @@ func (p *Proxy) handleTunneling(
 		done <- true
 	}()
 
-	// 転送完了待ち
 	<-done
 	logEntry.Status = http.StatusOK
 	logEntry.BytesIn = <-bytesIn
@@ -213,16 +374,34 @@ func (p *Proxy) handleTunneling(
 }
 
 func main() {
+	// 作業ディレクトリの取得
+	workDir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("Failed to get working directory: %v\n", err)
+		return
+	}
+
+	// 設定ファイルのパスを設定
+	logPath := filepath.Join(workDir, LogFilePath)
+	blockListPath := filepath.Join(workDir, BlockListPath)
+
 	// ロガーの初期化
-	logger, err := NewLogger(LogFilePath)
+	logger, err := NewLogger(logPath)
 	if err != nil {
 		fmt.Printf("Failed to initialize logger: %v\n", err)
 		return
 	}
 	defer logger.Close()
 
+	// アクセス制御の初期化
+	ac, err := NewAccessControl(blockListPath)
+	if err != nil {
+		fmt.Printf("Failed to initialize access control: %v\n", err)
+		return
+	}
+
 	// プロキシサーバーの作成と起動
-	proxy := NewProxy(logger)
+	proxy := NewProxy(logger, ac)
 	if err := proxy.Start(); err != nil {
 		fmt.Printf("Failed to start proxy: %v\n", err)
 		return
