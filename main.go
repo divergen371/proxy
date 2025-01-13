@@ -1,135 +1,230 @@
-// Package main はシンプルなHTTPSプロキシサーバーを実装します
-// このプロキシサーバーは、HTTPSトンネリング（CONNECT メソッド）をサポートし、
-// クライアントとサーバー間の安全な通信を仲介します
 package main
 
 import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
+	"sync"
+	"time"
 )
 
-// main はプロキシサーバーを起動し、クライアントからの接続を待ち受けます.
-// ポート10080でTCP接続をリッスンし、新しい接続ごとにゴルーチンを起動して
-// 並行処理を実現します.
-func main() {
-	listener, err := net.Listen(("tcp"), ":10080")
+// 定数定義
+const (
+	// プロキシサーバーのポート番号
+	ProxyPort = ":10080"
+	// ログファイルのパス
+	LogFilePath = "proxy.log"
+	// チャネルバッファサイズ
+	tunnelDirections = 2
+)
+
+// LogEntry はアクセスログの1エントリを表す構造体
+type LogEntry struct {
+	Time     time.Time // アクセス時刻
+	ClientIP string    // クライアントのIPアドレス
+	Method   string    // HTTPメソッド
+	Host     string    // 接続先ホスト
+	URI      string    // リクエストURI
+	Status   int       // ステータスコード
+	BytesIn  int64     // 受信バイト数
+	BytesOut int64     // 送信バイト数
+	Duration float64   // 処理時間（秒）
+}
+
+// Logger はロギング機能を提供する構造体
+type Logger struct {
+	mu     sync.Mutex
+	file   *os.File
+	logger *log.Logger
+}
+
+// NewLogger は新しいLoggerインスタンスを作成する
+func NewLogger(filename string) (*Logger, error) {
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Println("Error starting server:", err)
-		return
+		return nil, fmt.Errorf("failed to open log file: %v", err)
 	}
-	defer func(listener net.Listener) {
-		err := listener.Close()
-		if err != nil {
-			fmt.Println("Error closing listener:", err)
-			return
-		}
-	}(listener)
-	fmt.Println("TCP server listening on port 10080")
 
-	for {
-		// 接続を受け入れ、新しいゴルーチンで処理
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("Error accepting connection:", err)
-			return
-		}
+	return &Logger{
+		file:   file,
+		logger: log.New(file, "", log.Ldate|log.Ltime),
+	}, nil
+}
 
-		// クライアント毎に新しいゴルーチンを起動
-		go HandleConnection(conn)
+// Log はアクセスログを記録する
+func (l *Logger) Log(entry LogEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// ログメッセージのフォーマット
+	message := fmt.Sprintf(
+		"%s %s %s %s %d %d bytes in %d bytes out %.3f seconds",
+		entry.ClientIP,
+		entry.Method,
+		entry.Host,
+		entry.URI,
+		entry.Status,
+		entry.BytesIn,
+		entry.BytesOut,
+		entry.Duration,
+	)
+
+	l.logger.Println(message)
+}
+
+// Close はロガーのリソースを解放する
+func (l *Logger) Close() error {
+	return l.file.Close()
+}
+
+// Proxy はプロキシサーバーの構造体
+type Proxy struct {
+	logger *Logger
+}
+
+// NewProxy は新しいProxyインスタンスを作成する
+func NewProxy(logger *Logger) *Proxy {
+	return &Proxy{
+		logger: logger,
 	}
 }
 
-// HandleConnection handleConnection はクライアントとの接続を処理します.
-// HTTPS CONNECTトンネリングをサポートし、以下の手順で処理を行います：
-// 1. クライアントからのCONNECTリクエストを読み取り
-// 2. 対象サーバーへの接続を確立
-// 3. クライアントへ200 OKレスポンスを送信
-// 4. クライアントとサーバー間の双方向トンネリングを作成
-//
-// トンネリングの仕組み：
-// - 2つのゴルーチンを使用して双方向データ転送を実現
-// - isClosed チャネルを使用して接続終了を検知
-// - io.Copy を使用して効率的なデータ転送を実現
-//
-// エラーハンドリング：
-// - 接続エラー、リクエスト読み取りエラー、レスポンス送信エラーを適切に処理
-// - エラー発生時はログ出力して接続を終了
-//
-// パラメータ：
-//   - clientConn: クライアントからのTCP接続
-func HandleConnection(clientConn net.Conn) {
-	defer func(clientConn net.Conn) {
-		err := clientConn.Close()
-		if err != nil {
-			fmt.Println("Error closing client connection:", err)
-		}
-	}(clientConn)
-	fmt.Println("Client Connected:", clientConn.RemoteAddr().String())
-
-	// クライアントからのHTTPリクエストを読み取り
-	reader := bufio.NewReader(clientConn)
-	req, err := http.ReadRequest(reader)
+// Start はプロキシサーバーを起動する
+func (p *Proxy) Start() error {
+	listener, err := net.Listen("tcp", ProxyPort)
 	if err != nil {
-		fmt.Println("Error reading request:", err)
+		return fmt.Errorf("failed to start server: %v", err)
+	}
+	defer listener.Close()
+
+	fmt.Printf("Proxy server listening on port %s\n", ProxyPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Printf("Error accepting connection: %v\n", err)
+			continue
+		}
+		go p.handleConnection(conn)
+	}
+}
+
+// handleConnection はクライアントとの接続を処理する
+func (p *Proxy) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	startTime := time.Now()
+	clientIP := clientConn.RemoteAddr().String()
+
+	// リクエストの読み取り
+	reader := bufio.NewReader(clientConn)
+	request, err := http.ReadRequest(reader)
+	if err != nil {
+		fmt.Printf("Error reading request: %v\n", err)
 		return
 	}
 
-	fmt.Println("Request received!")
-	switch req.Method {
-	case http.MethodConnect:
-		// HTTPS CONNECTトンネリングの処理
-		fmt.Println("Connect to server:", req.URL.Host)
-		serverConn, err := net.Dial("tcp", req.URL.Host)
+	// ログエントリの初期化
+	logEntry := LogEntry{
+		Time:     startTime,
+		ClientIP: clientIP,
+		Method:   request.Method,
+		Host:     request.Host,
+		URI:      request.RequestURI,
+	}
+
+	// CONNECTメソッドの処理
+	if request.Method == http.MethodConnect {
+		p.handleTunneling(clientConn, request, &logEntry)
+	} else {
+		logEntry.Status = http.StatusMethodNotAllowed
+		p.logger.Log(logEntry)
+		fmt.Printf("Method not supported: %s\n", request.Method)
+	}
+}
+
+// handleTunneling はHTTPSトンネリングを処理する
+func (p *Proxy) handleTunneling(
+	clientConn net.Conn, request *http.Request, logEntry *LogEntry,
+) {
+	startTime := time.Now()
+	// サーバーへの接続
+	serverConn, err := net.Dial("tcp", request.Host)
+	if err != nil {
+		fmt.Printf("Error connecting to server: %v\n", err)
+		logEntry.Status = http.StatusBadGateway
+		p.logger.Log(*logEntry)
+		return
+	}
+	defer serverConn.Close()
+
+	// クライアントへ200 OKを送信
+	response := &http.Response{
+		Status:     "200 Connection established",
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+	}
+
+	if err := response.Write(clientConn); err != nil {
+		fmt.Printf("Error writing response: %v\n", err)
+		logEntry.Status = http.StatusInternalServerError
+		p.logger.Log(*logEntry)
+		return
+	}
+
+	// 双方向トンネルの作成
+	bytesIn := make(chan int64, 1)
+	bytesOut := make(chan int64, 1)
+	done := make(chan bool, tunnelDirections)
+
+	// クライアント → サーバー
+	go func() {
+		n, err := io.Copy(serverConn, clientConn)
 		if err != nil {
-			fmt.Println("Error connecting to server:", err)
-			return
+			fmt.Printf("Error copying client to server: %v\n", err)
 		}
-		defer func(serverConn net.Conn) {
-			err := serverConn.Close()
-			if err != nil {
-				fmt.Println("Error closing server connection:", err)
-			}
-		}(serverConn)
+		bytesIn <- n
+		done <- true
+	}()
 
-		// クライアントへ接続確立応答を送信
-		response := &http.Response{
-			StatusCode: http.StatusOK,
-			ProtoMajor: 1,
-			ProtoMinor: 1,
+	// サーバー → クライアント
+	go func() {
+		n, err := io.Copy(clientConn, serverConn)
+		if err != nil {
+			fmt.Printf("Error copying server to client: %v\n", err)
 		}
+		bytesOut <- n
+		done <- true
+	}()
 
-		if err := response.Write(clientConn); err != nil {
-			fmt.Println("Error writing response:", err)
-			return
-		}
+	// 転送完了待ち
+	<-done
+	logEntry.Status = http.StatusOK
+	logEntry.BytesIn = <-bytesIn
+	logEntry.BytesOut = <-bytesOut
+	logEntry.Duration = time.Since(startTime).Seconds()
+	p.logger.Log(*logEntry)
+}
 
-		// 双方向トンネルの作成
-		isClosed := make(chan bool, 2)
+func main() {
+	// ロガーの初期化
+	logger, err := NewLogger(LogFilePath)
+	if err != nil {
+		fmt.Printf("Failed to initialize logger: %v\n", err)
+		return
+	}
+	defer logger.Close()
 
-		// クライアント → サーバーの転送
-		go func() {
-			_, err := io.Copy(serverConn, clientConn)
-			if err != nil {
-				fmt.Println("Error copying data from client to server:", err)
-			}
-			isClosed <- true
-		}()
-
-		// サーバー → クライアントの転送
-		go func() {
-			_, err := io.Copy(clientConn, serverConn)
-			if err != nil {
-				fmt.Println("Error copying data from server to client:", err)
-			}
-			isClosed <- true
-		}()
-
-		<-isClosed
-
-	default:
-		fmt.Println("Method not supported:", req.Method)
+	// プロキシサーバーの作成と起動
+	proxy := NewProxy(logger)
+	if err := proxy.Start(); err != nil {
+		fmt.Printf("Failed to start proxy: %v\n", err)
+		return
 	}
 }
