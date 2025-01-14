@@ -1,0 +1,58 @@
+#-------------------------------------------------------------------------------#
+#               Qodana analysis is configured by qodana.yaml file               #
+#             https://www.jetbrains.com/help/qodana/qodana-yaml.html            #
+#-------------------------------------------------------------------------------#
+version: "1.0"
+#Specify inspection profile for code analysis
+profile:
+  name: qodana.starter
+#Enable inspections
+#include:
+#  - name: <SomeEnabledInspectionId>
+#Disable inspections
+#exclude:
+#  - name: <SomeDisabledInspectionId>
+#    paths:
+#      - <path/where/not/run/inspection>
+#Execute shell command before Qodana execution (Applied in CI/CD pipeline)
+#bootstrap: sh ./prepare-qodana.sh
+#Install IDE plugins before Qodana execution (Applied in CI/CD pipeline)
+#plugins:
+#  - id: <plugin.id> #(plugin id can be found at https://plugins.jetbrains.com)
+#Specify Qodana linter for analysis (Applied in CI/CD pipeline)
+linter: jetbrains/qodana-jvm:2024.3
+exclude:
+  - name: All
+    paths:
+      - cmd
+      - cmd/proxy
+      - cmd/proxy/main.go
+      - internal
+      - internal/domain
+      - internal/domain/access.go
+      - internal/domain/errors.go
+      - internal/domain/metrics.go
+      - internal/interface
+      - internal/interface/connection
+      - internal/interface/connection/manager.go
+      - internal/interface/handler
+      - internal/interface/handler/metrics.go
+      - internal/interface/handler/proxy.go
+      - internal/interface/repository
+      - internal/interface/repository/access
+      - internal/interface/repository/access/config.go
+      - internal/interface/repository/access/repository.go
+      - internal/interface/repository/cache
+      - internal/interface/repository/cache/entry.go
+      - internal/interface/repository/cache/repository.go
+      - internal/interface/repository/logger
+      - internal/interface/repository/logger/fomatter.go
+      - internal/interface/repository/logger/repository.go
+      - internal/interface/repository/logger/rotation.go
+      - internal/interface/repository/metrics
+      - internal/interface/repository/metrics/repository.go
+      - internal/interface/repository/metrics/snapshot.go
+      - internal/usecase
+      - internal/usecase/metrics.go
+      - internal/usecase/proxy.go
+      - main_test.go
