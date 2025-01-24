@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/proxy.iml" filepath="$PROJECT_DIR$/proxy.iml" />
+      <module fileurl="file://$PROJECT_DIR$/Talisman.iml" filepath="$PROJECT_DIR$/Talisman.iml" />
     </modules>
   </component>
 </project>
